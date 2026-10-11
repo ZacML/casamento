@@ -23,9 +23,11 @@ create table if not exists venues (
   price numeric(12,2),
   contact text,
   url text,
+  photos jsonb not null default '[]'::jsonb,
   status text not null default 'Pesquisando',
   notes text
 );
+-- (se a tabela já existia: alter table venues add column if not exists photos jsonb not null default '[]'::jsonb;)
 
 -- Decoradores (category = 'Decoração'), fotógrafos ('Fotografia') e outros fornecedores
 create table if not exists vendors (
@@ -78,3 +80,10 @@ begin
     execute format('create policy "acesso_total" on %I for all to anon, authenticated using (true) with check (true)', t);
   end loop;
 end $$;
+
+-- Fotos dos locais: bucket público para leitura; envio liberado como nas tabelas (sem login)
+insert into storage.buckets (id, name, public) values ('fotos-locais', 'fotos-locais', true)
+on conflict (id) do nothing;
+drop policy if exists "fotos_locais_acesso" on storage.objects;
+create policy "fotos_locais_acesso" on storage.objects for all to anon, authenticated
+  using (bucket_id = 'fotos-locais') with check (bucket_id = 'fotos-locais');

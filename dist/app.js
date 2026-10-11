@@ -73,10 +73,11 @@ const entities = [
             { key: "price", label: "Valor (R$)", type: "number", money: true },
             { key: "contact", label: "Telefone / e-mail", type: "text" },
             { key: "url", label: "Site", type: "url" },
+            { key: "photos", label: "Fotos do local", type: "photos" },
             { key: "status", label: "Situação", type: "select", options: ["Pesquisando", "Visita marcada", "Visitado", "Contratado", "Descartado"] },
             { key: "notes", label: "Observações", type: "textarea" }
         ],
-        columns: ["name", "city", "capacity", "price", "status"] },
+        columns: ["photos", "name", "city", "capacity", "price", "status"] },
     { id: "decoradores", table: "vendors", title: "Decoradores", singular: "decorador", intro: "Compare orçamentos e estilos.",
         fields: vendorFields(), columns: ["name", "price", "contact", "status"],
         match: r => r.category === "Decoração", fixed: { category: "Decoração" } },
@@ -109,6 +110,10 @@ const entities = [
 const slug = (s) => (s === "Confirmado" || s === "Contratado" ? "ok" : s === "Recusou" || s === "Descartado" ? "no" : "wait");
 function cell(f, r) {
     const v = r[f.key];
+    if (f.type === "photos") {
+        const p = v ?? [];
+        return p.length ? `<button class="thumb" data-gallery="${r.id}" aria-label="Ver ${p.length} foto(s)"><img src="${esc(p[0])}" alt=""><span>${p.length}</span></button>` : "";
+    }
     if (f.type === "checkbox")
         return `<input type="checkbox" data-toggle="${f.key}" data-id="${r.id}" ${v ? "checked" : ""} aria-label="${esc(f.label)}">`;
     if (v === null || v === undefined || v === "")
@@ -140,6 +145,7 @@ async function renderEntity(e) {
         await run(() => store.remove(e.table, b.dataset.del), "Excluído");
         renderEntity(e);
     });
+    main.querySelectorAll("[data-gallery]").forEach(b => b.onclick = () => openGallery(rows.find(r => r.id === b.dataset.gallery)));
     main.querySelectorAll("[data-toggle]").forEach(b => b.onchange = async () => {
         const r = rows.find(x => x.id === b.dataset.id);
         await run(() => store.save(e.table, { ...r, [b.dataset.toggle]: b.checked }), "Atualizado");
@@ -153,21 +159,55 @@ function openForm(e, r) {
         const input = f.type === "select" ? `<select ${attrs}>${(f.options ?? []).map(o => `<option ${o === (v || f.options[0]) ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`
             : f.type === "textarea" ? `<textarea ${attrs} rows="3">${esc(v)}</textarea>`
                 : f.type === "checkbox" ? `<input type="checkbox" ${attrs} ${v ? "checked" : ""}>`
-                    : `<input type="${f.type}" ${attrs} value="${esc(v)}" ${f.type === "number" ? 'step="any" min="0"' : ""}>`;
+                    : f.type === "photos" ? `<input type="file" id="ph-in" accept="image/*" multiple></label><div class="ph" id="ph"></div><label hidden>`
+                        : `<input type="${f.type}" ${attrs} value="${esc(v)}" ${f.type === "number" ? 'step="any" min="0"' : ""}>`;
         return `<label>${f.label}${input}</label>`;
     }).join("") + `<div class="row"><button type="button" id="cancel">Cancelar</button><button class="primary" type="submit">Salvar</button></div>`;
     document.getElementById("cancel").onclick = () => dlg.close();
+    const items = [...(r.photos ?? [])];
+    const drawPh = () => {
+        const box = document.getElementById("ph");
+        if (!box)
+            return;
+        box.innerHTML = items.map((it, k) => `<div><img src="${esc(typeof it === "string" ? it : it.url)}" alt="Foto ${k + 1}"><button type="button" data-rm="${k}" aria-label="Remover foto ${k + 1}">×</button></div>`).join("");
+        box.querySelectorAll("[data-rm]").forEach(b => b.onclick = () => { items.splice(Number(b.dataset.rm), 1); drawPh(); });
+    };
+    const inp = document.getElementById("ph-in");
+    if (inp) {
+        drawPh();
+        inp.onchange = async () => {
+            for (const f of Array.from(inp.files ?? [])) {
+                try {
+                    const blob = await shrink(f);
+                    items.push({ blob, url: URL.createObjectURL(blob) });
+                }
+                catch {
+                    toast("Não foi possível ler " + f.name);
+                }
+            }
+            inp.value = "";
+            drawPh();
+        };
+    }
     form.onsubmit = async (ev) => {
         ev.preventDefault();
         const fd = new FormData(form);
-        const data = { ...r, ...e.fixed };
-        for (const f of e.fields) {
-            const v = fd.get(f.key);
-            data[f.key] = f.type === "checkbox" ? v !== null : f.type === "number" ? (v === "" ? null : Number(v)) : v === "" ? null : v;
+        const ok = await run(async () => {
+            const data = { ...r, ...e.fixed };
+            for (const f of e.fields) {
+                if (f.type === "photos") {
+                    data[f.key] = await Promise.all(items.map(it => typeof it === "string" ? it : uploadPhoto(it.blob)));
+                    continue;
+                }
+                const v = fd.get(f.key);
+                data[f.key] = f.type === "checkbox" ? v !== null : f.type === "number" ? (v === "" ? null : Number(v)) : v === "" ? null : v;
+            }
+            await store.save(e.table, data);
+        }, "Salvo");
+        if (ok) {
+            dlg.close();
+            renderEntity(e);
         }
-        await run(() => store.save(e.table, data), "Salvo");
-        dlg.close();
-        renderEntity(e);
     };
     dlg.showModal();
 }
@@ -175,10 +215,46 @@ async function run(fn, ok) {
     try {
         await fn();
         toast(ok);
+        return true;
     }
     catch (err) {
         toast("Erro: " + (err?.message ?? err));
+        return false;
     }
+}
+// ---------- Fotos: reduz a imagem e envia ao Storage do Supabase (ou guarda local) ----------
+async function shrink(file) {
+    const bmp = await createImageBitmap(file);
+    const k = Math.min(1, 1400 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(bmp.width * k);
+    c.height = Math.round(bmp.height * k);
+    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+    return new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error("Imagem inválida")), "image/jpeg", 0.82));
+}
+async function uploadPhoto(b) {
+    if (cloud) {
+        const path = `${crypto.randomUUID()}.jpg`;
+        const { error } = await sb.storage.from("fotos-locais").upload(path, b, { contentType: "image/jpeg" });
+        if (error)
+            throw error;
+        return sb.storage.from("fotos-locais").getPublicUrl(path).data.publicUrl;
+    }
+    return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(fr.error); fr.readAsDataURL(b); });
+}
+function openGallery(r) {
+    const gal = document.getElementById("gal");
+    const p = r.photos ?? [];
+    let i = 0;
+    const draw = () => {
+        gal.innerHTML = `<h2>${esc(r.name)}</h2><img class="big" src="${esc(p[i])}" alt="Foto ${i + 1} de ${esc(r.name)}">
+      <div class="strip">${p.map((s, k) => `<button data-k="${k}" class="${k === i ? "on" : ""}" aria-label="Foto ${k + 1}"><img src="${esc(s)}" alt=""></button>`).join("")}</div>
+      <div class="row"><button class="primary" id="gclose">Fechar</button></div>`;
+        gal.querySelectorAll("[data-k]").forEach(b => b.onclick = () => { i = Number(b.dataset.k); draw(); });
+        document.getElementById("gclose").onclick = () => gal.close();
+    };
+    draw();
+    gal.showModal();
 }
 const banner = () => cloud ? "" : `<div class="banner">Modo local: os dados ficam só neste navegador. Preencha o <b>config.js</b> para salvar no Supabase.</div>`;
 async function renderHome() {
