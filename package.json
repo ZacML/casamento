@@ -1,0 +1,1 @@
+{"name":"casamento","private":true,"scripts":{"build":"tsc","watch":"tsc -w","serve":"npx serve ."},"devDependencies":{"typescript":"^5.9.3"}}
